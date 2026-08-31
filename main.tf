@@ -18,9 +18,8 @@ data "aws_availability_zones" "available" {
 }
 
 data "aws_rds_engine_version" "latest_postgres" {
-  engine  = "postgres"
-  version = "15"
-  # This is the secret: it picks the version AWS recommends as default
+  engine       = "postgres"
+  version      = "15"
   default_only = true
 }
 
@@ -29,8 +28,7 @@ data "aws_ami" "amazon_linux_2023" {
   owners      = ["amazon"]
 
   filter {
-    name = "name"
-    # This wildcard finds any 2023 AMI for x86 architecture
+    name   = "name"
     values = ["al2023-ami-2023*-x86_64"]
   }
 
@@ -47,33 +45,51 @@ resource "aws_vpc" "main" {
   tags                 = { Name = "production-vpc" }
 }
 
+# Tier 1: Public Subnets
 resource "aws_subnet" "public" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.${count.index + 1}.0/24"
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
-  tags                    = { Name = "public-subnet-${count.index}" }
+  tags                    = { Name = "public-subnet-${count.index + 1}" }
 }
 
-resource "aws_subnet" "private" {
+# Tier 2: Private App Subnets
+resource "aws_subnet" "private_app" {
   count             = 2
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.${count.index + 10}.0/24"
   availability_zone = data.aws_availability_zones.available.names[count.index]
-  tags              = { Name = "private-subnet-${count.index}" }
+  tags              = { Name = "private-app-subnet-${count.index + 1}" }
+}
+
+# Tier 3: Private DB Subnets
+resource "aws_subnet" "private_db" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.${count.index + 20}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  tags              = { Name = "private-db-subnet-${count.index + 1}" }
 }
 
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
+  tags   = { Name = "production-igw" }
 }
 
-resource "aws_eip" "nat" { domain = "vpc" }
+# TWO Elastic IPs and TWO NAT Gateways (One per AZ)
+resource "aws_eip" "nat" {
+  count  = 2
+  domain = "vpc"
+}
 
 resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public[0].id
+  count         = 2
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
   depends_on    = [aws_internet_gateway.igw]
+  tags          = { Name = "nat-gateway-${count.index + 1}" }
 }
 
 # --- 4. ROUTING ---
@@ -91,18 +107,31 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-resource "aws_route_table" "private" {
+# TWO Private Route Tables for App Tier (each points to its own NAT)
+resource "aws_route_table" "private_app" {
+  count  = 2
   vpc_id = aws_vpc.main.id
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main.id
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
   }
 }
 
-resource "aws_route_table_association" "private" {
+resource "aws_route_table_association" "private_app" {
   count          = 2
-  subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private.id
+  subnet_id      = aws_subnet.private_app[count.index].id
+  route_table_id = aws_route_table.private_app[count.index].id
+}
+
+# DB Tier Route Table (Strictly local, no internet out for maximum security)
+resource "aws_route_table" "private_db" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_route_table_association" "private_db" {
+  count          = 2
+  subnet_id      = aws_subnet.private_db[count.index].id
+  route_table_id = aws_route_table.private_db.id
 }
 
 # --- 5. SECURITY GROUPS ---
@@ -110,21 +139,22 @@ resource "aws_security_group" "app_sg" {
   name   = "app-server-sg"
   vpc_id = aws_vpc.main.id
 
-  # HTTP access
+  # HTTP from inside the VPC only. The instance sits in a private subnet with
+  # no public IP, so an internet-wide rule here would be dead weight that reads
+  # like an oversight. A load balancer in the public subnets would still reach it.
   ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [aws_vpc.main.cidr_block]
   }
 
-  # SSH restricted to the operator workstation only, never 0.0.0.0/0
+  # SSH access (Restricted to your IP)
   ingress {
-    description = "SSH from operator workstation"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.admin_cidr]
+    cidr_blocks = [var.my_ip]
   }
 
   egress {
@@ -145,12 +175,17 @@ resource "aws_security_group" "db_sg" {
     protocol        = "tcp"
     security_groups = [aws_security_group.app_sg.id]
   }
+
+  # Deliberately no egress block. Security groups are stateful, so replies to
+  # the application still flow; what the database cannot do is open outbound
+  # connections of its own. That blocks data exfiltration if it is ever
+  # compromised.
 }
 
 # --- 6. DATABASE LAYER ---
 resource "aws_db_subnet_group" "main" {
   name       = "main-db-subnet-group"
-  subnet_ids = [aws_subnet.private[0].id, aws_subnet.private[1].id]
+  subnet_ids = [aws_subnet.private_db[0].id, aws_subnet.private_db[1].id]
 }
 
 resource "aws_db_instance" "postgres" {
@@ -158,15 +193,16 @@ resource "aws_db_instance" "postgres" {
   allocated_storage = 20
   db_name           = "myappdb"
 
-  # Update these references to match the new data source name
   engine         = data.aws_rds_engine_version.latest_postgres.engine
   engine_version = data.aws_rds_engine_version.latest_postgres.version
 
   instance_class = "db.t3.micro"
   username       = "dbadmin"
 
-  # var.db_password would still be written in plaintext into terraform.tfstate.
-  # Letting RDS generate and store it in Secrets Manager keeps it out of both.
+  # A Terraform variable would still land in plaintext inside terraform.tfstate,
+  # even marked sensitive. Letting RDS generate the password and hold it in
+  # Secrets Manager keeps it out of the code and out of the state, and allows
+  # rotation.
   manage_master_user_password = true
 
   db_subnet_group_name   = aws_db_subnet_group.main.name
@@ -188,22 +224,22 @@ resource "aws_db_instance" "postgres" {
 resource "aws_instance" "app_server" {
   ami                         = data.aws_ami.amazon_linux_2023.id
   instance_type               = "t3.micro"
-  subnet_id                   = aws_subnet.public[0].id
+  subnet_id                   = aws_subnet.private_app[0].id # Moved to Private Subnet
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
-  associate_public_ip_address = true
+  associate_public_ip_address = false # Secured!
   key_name                    = var.key_name
 
   tags = { Name = "app-server" }
 }
 
 # --- 8. VARIABLES ---
-variable "admin_cidr" {
-  description = "Your workstation public IP in CIDR form, e.g. 203.0.113.4/32"
+variable "key_name" {
+  description = "Name of an existing EC2 key pair in your account"
   type        = string
 }
 
-variable "key_name" {
-  description = "Name of an existing EC2 key pair in your account"
+variable "my_ip" {
+  description = "My personal IP address for SSH access (e.g., 203.0.113.5/32)"
   type        = string
 }
 
@@ -212,6 +248,6 @@ output "db_endpoint" {
   value = aws_db_instance.postgres.endpoint
 }
 
-output "ec2_public_ip" {
-  value = aws_instance.app_server.public_ip
+output "ec2_private_ip" { # Changed from public to private
+  value = aws_instance.app_server.private_ip
 }
