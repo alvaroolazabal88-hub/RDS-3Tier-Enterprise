@@ -18,10 +18,10 @@ data "aws_availability_zones" "available" {
 }
 
 data "aws_rds_engine_version" "latest_postgres" {
-  engine       = "postgres"
-  version      = "15"
+  engine  = "postgres"
+  version = "15"
   # This is the secret: it picks the version AWS recommends as default
-  default_only = true 
+  default_only = true
 }
 
 data "aws_ami" "amazon_linux_2023" {
@@ -29,9 +29,9 @@ data "aws_ami" "amazon_linux_2023" {
   owners      = ["amazon"]
 
   filter {
-    name   = "name"
+    name = "name"
     # This wildcard finds any 2023 AMI for x86 architecture
-    values = ["al2023-ami-2023*-x86_64"] 
+    values = ["al2023-ami-2023*-x86_64"]
   }
 
   filter {
@@ -107,8 +107,8 @@ resource "aws_route_table_association" "private" {
 
 # --- 5. SECURITY GROUPS ---
 resource "aws_security_group" "app_sg" {
-  name        = "app-server-sg"
-  vpc_id      = aws_vpc.main.id
+  name   = "app-server-sg"
+  vpc_id = aws_vpc.main.id
 
   # HTTP access
   ingress {
@@ -118,12 +118,13 @@ resource "aws_security_group" "app_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # SSH access (Port 22 added)
+  # SSH restricted to the operator workstation only, never 0.0.0.0/0
   ingress {
+    description = "SSH from operator workstation"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # In production, use your specific IP
+    cidr_blocks = [var.admin_cidr]
   }
 
   egress {
@@ -135,8 +136,8 @@ resource "aws_security_group" "app_sg" {
 }
 
 resource "aws_security_group" "db_sg" {
-  name        = "rds-private-sg"
-  vpc_id      = aws_vpc.main.id
+  name   = "rds-private-sg"
+  vpc_id = aws_vpc.main.id
 
   ingress {
     from_port       = 5432
@@ -153,23 +154,27 @@ resource "aws_db_subnet_group" "main" {
 }
 
 resource "aws_db_instance" "postgres" {
-  identifier           = "lab-db"
-  allocated_storage    = 20
-  db_name              = "myappdb"
-  
+  identifier        = "lab-db"
+  allocated_storage = 20
+  db_name           = "myappdb"
+
   # Update these references to match the new data source name
-  engine               = data.aws_rds_engine_version.latest_postgres.engine
-  engine_version       = data.aws_rds_engine_version.latest_postgres.version
-  
-  instance_class       = "db.t3.micro" 
-  username             = "dbadmin"
-  password             = var.db_password
-  
+  engine         = data.aws_rds_engine_version.latest_postgres.engine
+  engine_version = data.aws_rds_engine_version.latest_postgres.version
+
+  instance_class = "db.t3.micro"
+  username       = "dbadmin"
+
+  # var.db_password would still be written in plaintext into terraform.tfstate.
+  # Letting RDS generate and store it in Secrets Manager keeps it out of both.
+  manage_master_user_password = true
+
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.db_sg.id]
-  
+
   multi_az            = true
   publicly_accessible = false
+  storage_encrypted   = true
   skip_final_snapshot = true
 
   lifecycle {
@@ -186,16 +191,20 @@ resource "aws_instance" "app_server" {
   subnet_id                   = aws_subnet.public[0].id
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
   associate_public_ip_address = true
-key_name                    = "Macbook_Air_Key"
+  key_name                    = var.key_name
 
   tags = { Name = "app-server" }
 }
 
 # --- 8. VARIABLES ---
-variable "db_password" {
-  description = "Password for the RDS instance"
+variable "admin_cidr" {
+  description = "Your workstation public IP in CIDR form, e.g. 203.0.113.4/32"
   type        = string
-  sensitive   = true
+}
+
+variable "key_name" {
+  description = "Name of an existing EC2 key pair in your account"
+  type        = string
 }
 
 # --- 9. OUTPUTS ---
