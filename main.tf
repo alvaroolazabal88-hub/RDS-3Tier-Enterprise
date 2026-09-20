@@ -1,4 +1,3 @@
-# --- 1. PROVIDER CONFIGURATION ---
 terraform {
   required_providers {
     aws = {
@@ -9,10 +8,9 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1" # You can change this to your preferred region
+  region = "us-east-1"
 }
 
-# --- 2. DATA SOURCES ---
 data "aws_availability_zones" "available" {
   state = "available"
 }
@@ -38,14 +36,12 @@ data "aws_ami" "amazon_linux_2023" {
   }
 }
 
-# --- 3. NETWORK LAYER ---
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   tags                 = { Name = "production-vpc" }
 }
 
-# Tier 1: Public Subnets
 resource "aws_subnet" "public" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
@@ -55,7 +51,6 @@ resource "aws_subnet" "public" {
   tags                    = { Name = "public-subnet-${count.index + 1}" }
 }
 
-# Tier 2: Private App Subnets
 resource "aws_subnet" "private_app" {
   count             = 2
   vpc_id            = aws_vpc.main.id
@@ -64,7 +59,6 @@ resource "aws_subnet" "private_app" {
   tags              = { Name = "private-app-subnet-${count.index + 1}" }
 }
 
-# Tier 3: Private DB Subnets
 resource "aws_subnet" "private_db" {
   count             = 2
   vpc_id            = aws_vpc.main.id
@@ -92,7 +86,6 @@ resource "aws_nat_gateway" "main" {
   tags          = { Name = "nat-gateway-${count.index + 1}" }
 }
 
-# --- 4. ROUTING ---
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
   route {
@@ -134,7 +127,6 @@ resource "aws_route_table_association" "private_db" {
   route_table_id = aws_route_table.private_db.id
 }
 
-# --- 5. SECURITY GROUPS ---
 resource "aws_security_group" "app_sg" {
   name   = "app-server-sg"
   vpc_id = aws_vpc.main.id
@@ -182,7 +174,6 @@ resource "aws_security_group" "db_sg" {
   # compromised.
 }
 
-# --- 6. DATABASE LAYER ---
 resource "aws_db_subnet_group" "main" {
   name       = "main-db-subnet-group"
   subnet_ids = [aws_subnet.private_db[0].id, aws_subnet.private_db[1].id]
@@ -220,19 +211,17 @@ resource "aws_db_instance" "postgres" {
   tags = { Name = "production-db" }
 }
 
-# --- 7. COMPUTE LAYER ---
 resource "aws_instance" "app_server" {
   ami                         = data.aws_ami.amazon_linux_2023.id
   instance_type               = "t3.micro"
-  subnet_id                   = aws_subnet.private_app[0].id # Moved to Private Subnet
+  subnet_id                   = aws_subnet.private_app[0].id
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
-  associate_public_ip_address = false # Secured!
+  associate_public_ip_address = false
   key_name                    = var.key_name
 
   tags = { Name = "app-server" }
 }
 
-# --- 8. VARIABLES ---
 variable "key_name" {
   description = "Name of an existing EC2 key pair in your account"
   type        = string
@@ -243,11 +232,10 @@ variable "my_ip" {
   type        = string
 }
 
-# --- 9. OUTPUTS ---
 output "db_endpoint" {
   value = aws_db_instance.postgres.endpoint
 }
 
-output "ec2_private_ip" { # Changed from public to private
+output "ec2_private_ip" {
   value = aws_instance.app_server.private_ip
 }
